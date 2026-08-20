@@ -1,0 +1,42 @@
+# Organization-wide secret scan, enforced on every repository via an
+# Organization Ruleset ("Require workflows to pass before merging").
+# Scans only the commits contained in the pull request, so pre-existing
+# secrets in old history do not block unrelated PRs.
+# Per-repository false-positive exceptions: put a .gitleaks.toml at the
+# target repository's root (gitleaks picks it up automatically).
+name: Gitleaks
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    name: Secret scan (PR commits)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        run: |
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz -o /tmp/gitleaks.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  /tmp/gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo mv /tmp/gitleaks /usr/local/bin/gitleaks
+
+      - name: Scan PR commits for secrets
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          gitleaks git . \
+            --no-banner \
+            --redact \
+            --verbose \
+            --log-opts="${BASE_SHA}..${HEAD_SHA}"
