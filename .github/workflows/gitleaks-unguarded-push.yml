@@ -5,28 +5,29 @@
 # creation" enabled so that a brand-new repository can receive its first
 # push — but that first push therefore lands WITHOUT any secret scan.
 #
-# This workflow closes that gap after the fact: every hour it looks for
-# repositories whose default branch was pushed to recently but has never
+# This workflow closes that gap after the fact: once a week it looks for
+# repositories whose default branch was pushed to within the last 8 days
+# (7-day cadence + margin) but has never
 # received a merged PR (i.e. its contents arrived by direct push only),
 # scans their FULL history with gitleaks, and if secrets are found opens an
 # issue in that repository and notifies Slack.
 #
-# Required repository secrets (rimo/.github):
-#   GITLEAKS_SCANNER_APP_ID / GITLEAKS_SCANNER_APP_PRIVATE_KEY
-#     GitHub App installed on all repositories with
-#     Contents: read, Metadata: read, Pull requests: read, Issues: write.
-#   SLACK_WEBHOOK_URL
+# Required secrets:
+#   RIMO_GITHUB_APP_ID / RIMO_GITHUB_APP_PRIVATE_KEY (org secrets)
+#     Existing org-wide GitHub App (rimo-github-actions), installed on all
+#     repositories with Contents / Issues / Pull requests / Metadata access.
+#   SLACK_WEBHOOK_URL (repository secret of rimo/.github)
 #     Incoming Webhook bound to the notification channel (#rimo-voice).
 name: Gitleaks (unguarded push scan)
 
 on:
   schedule:
-    - cron: "17 * * * *"
+    - cron: "0 1 * * 1"   # Monday 10:00 JST
   workflow_dispatch:
     inputs:
-      window_minutes:
-        description: "Look back this many minutes for pushes (default 90 = hourly cron + drift margin)"
-        default: "90"
+      window_days:
+        description: "Look back this many days for pushes (default 8 = weekly cron + margin)"
+        default: "8"
       repo:
         description: "Scan only this repository (name without owner), regardless of push time / PR history"
         default: ""
@@ -49,8 +50,8 @@ jobs:
         id: app
         uses: actions/create-github-app-token@v2
         with:
-          app-id: ${{ secrets.GITLEAKS_SCANNER_APP_ID }}
-          private-key: ${{ secrets.GITLEAKS_SCANNER_APP_PRIVATE_KEY }}
+          app-id: ${{ secrets.RIMO_GITHUB_APP_ID }}
+          private-key: ${{ secrets.RIMO_GITHUB_APP_PRIVATE_KEY }}
           owner: ${{ env.ORG }}
 
       - name: Install gitleaks
@@ -64,7 +65,7 @@ jobs:
         id: discover
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
-          WINDOW_MINUTES: ${{ inputs.window_minutes || '90' }}
+          WINDOW_DAYS: ${{ inputs.window_days || '8' }}
           ONLY_REPO: ${{ inputs.repo }}
         run: |
           set -euo pipefail
@@ -73,7 +74,7 @@ jobs:
           if [ -n "$ONLY_REPO" ]; then
             targets+=("$ONLY_REPO")
           else
-            since=$(date -u -d "-${WINDOW_MINUTES} minutes" +%Y-%m-%dT%H:%M:%SZ)
+            since=$(date -u -d "-${WINDOW_DAYS} days" +%Y-%m-%dT%H:%M:%SZ)
             echo "Looking for repositories pushed since ${since}"
 
             # Repositories the App can see, pushed within the window, non-empty, not archived.
