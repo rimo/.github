@@ -16,8 +16,9 @@
 #   RIMO_GITHUB_APP_ID / RIMO_GITHUB_APP_PRIVATE_KEY (org secrets)
 #     Existing org-wide GitHub App (rimo-github-actions), installed on all
 #     repositories with Contents / Issues / Pull requests / Metadata access.
-#   SLACK_WEBHOOK_URL (repository secret of rimo/.github)
-#     Incoming Webhook bound to the notification channel (#rimo-voice).
+#   SLACK_BOT_TOKEN (org secret)
+#     Existing org-wide Slack bot; messages go via chat.postMessage to
+#     #rimo-voice (same pattern as rimo-frontend's cron workflows).
 name: Gitleaks (unguarded push scan)
 
 on:
@@ -38,6 +39,7 @@ env:
   ORG: rimo
   GITLEAKS_VERSION: 8.30.1
   GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+  SLACK_CHANNEL: C0JNBFUK   # #rimo-voice
   SLACK_MENTION: "<@U02M7M8V7FU>"
 
 jobs:
@@ -181,23 +183,43 @@ jobs:
       - name: Notify Slack
         if: steps.scan.outputs.new_findings != '0' && steps.scan.outputs.new_findings != ''
         env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          if [ -z "$SLACK_WEBHOOK_URL" ]; then
-            echo "::error::SLACK_WEBHOOK_URL secret is not set"
-            exit 1
-          fi
           lines=$(awk -F'\t' '{ printf "• <%s|%s> — %s 件 (HEAD %s)\n", $4, $1, $3, substr($2,1,7) }' /tmp/findings.tsv)
-          text=$(printf '%s :rotating_light: *gitleaks: ruleset を通っていない push から秘密情報を検出しました*\n%s\n<%s/%s/actions/runs/%s|workflow run>' \
-            "$SLACK_MENTION" "$lines" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
-          payload=$(jq -n --arg text "$text" '{text: $text}')
-          code=$(curl -sS -o /tmp/slack.out -w '%{http_code}' -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL")
-          if [ "$code" != "200" ]; then
-            echo "::error::Slack webhook returned HTTP ${code}: $(cat /tmp/slack.out)"
+          text=$(printf '%s :rotating_light: *gitleaks: ruleset を通っていない push から秘密情報を検出しました*\n%s<%s|run を見る>' \
+            "$SLACK_MENTION" "$lines" "$RUN_URL")
+          PAYLOAD=$(jq -n --arg channel "$SLACK_CHANNEL" --arg text "$text" '{channel: $channel, text: $text, unfurl_links: false}')
+          RESPONSE=$(curl -fsS --max-time 15 -X POST "https://slack.com/api/chat.postMessage" \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+          echo "$RESPONSE" | jq -e '.ok == true' > /dev/null || {
+            echo "::error::Slack notification failed: $(echo "$RESPONSE" | jq -r '.error // "unknown"')"
             exit 1
-          fi
+          }
           echo "Slack notification sent."
+
+      # Weekly cron failures would otherwise pile up silently.
+      - name: Notify failure to Slack
+        if: failure()
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          PAYLOAD=$(jq -n --arg channel "$SLACK_CHANNEL" \
+            --arg text "${SLACK_MENTION} :rotating_light: *Gitleaks (unguarded push scan) の run が失敗しました* — <${RUN_URL}|run を見る>" \
+            '{channel: $channel, text: $text, unfurl_links: false}')
+          RESPONSE=$(curl -fsS --max-time 15 -X POST "https://slack.com/api/chat.postMessage" \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+          echo "$RESPONSE" | jq -e '.ok == true' > /dev/null || {
+            echo "::error::Slack notification failed: $(echo "$RESPONSE" | jq -r '.error // "unknown"')"
+            exit 1
+          }
 
       - name: Upload reports
         if: always() && steps.discover.outputs.count != '0'

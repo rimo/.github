@@ -24,6 +24,6 @@ ruleset は「Do not require workflows on creation」を有効にしてある(�
 こと(= 内容が直接 push だけで届いている)。一度でも PR が merge されれば以後は ruleset が守る。
 
 必要な secrets: org secret の `RIMO_GITHUB_APP_ID` / `RIMO_GITHUB_APP_PRIVATE_KEY`
-(既存の org 横断 GitHub App `rimo-github-actions`。全 repo に install 済み)と、この repo の
-`SLACK_WEBHOOK_URL`(`#rimo-voice` 向け Incoming Webhook)。
+(既存の org 横断 GitHub App `rimo-github-actions`。全 repo に install 済み)と、同じく org secret の
+`SLACK_BOT_TOKEN`(`chat.postMessage` で `#rimo-voice` へ投稿。追加の secret 登録は不要)。
 誤検知は対象 repo 直下の `.gitleaks.toml` で allowlist する(両 workflow 共通)。
