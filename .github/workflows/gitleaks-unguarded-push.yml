@@ -1,0 +1,208 @@
+# Detect-only companion to gitleaks.yml.
+#
+# gitleaks.yml is enforced by the org ruleset "Gitleaks" on every PR merge
+# into the default branch. The ruleset has "Do not require workflows on
+# creation" enabled so that a brand-new repository can receive its first
+# push — but that first push therefore lands WITHOUT any secret scan.
+#
+# This workflow closes that gap after the fact: every hour it looks for
+# repositories whose default branch was pushed to recently but has never
+# received a merged PR (i.e. its contents arrived by direct push only),
+# scans their FULL history with gitleaks, and if secrets are found opens an
+# issue in that repository and notifies Slack.
+#
+# Required repository secrets (rimo/.github):
+#   GITLEAKS_SCANNER_APP_ID / GITLEAKS_SCANNER_APP_PRIVATE_KEY
+#     GitHub App installed on all repositories with
+#     Contents: read, Metadata: read, Pull requests: read, Issues: write.
+#   SLACK_WEBHOOK_URL
+#     Incoming Webhook bound to the notification channel (#rimo-voice).
+name: Gitleaks (unguarded push scan)
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      window_minutes:
+        description: "Look back this many minutes for pushes (default 90 = hourly cron + drift margin)"
+        default: "90"
+      repo:
+        description: "Scan only this repository (name without owner), regardless of push time / PR history"
+        default: ""
+
+permissions: {}
+
+env:
+  ORG: rimo
+  GITLEAKS_VERSION: 8.30.1
+  GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+  SLACK_MENTION: "<@U02M7M8V7FU>"
+
+jobs:
+  scan:
+    name: Full-history scan of unguarded repositories
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Issue GitHub App token
+        id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.GITLEAKS_SCANNER_APP_ID }}
+          private-key: ${{ secrets.GITLEAKS_SCANNER_APP_PRIVATE_KEY }}
+          owner: ${{ env.ORG }}
+
+      - name: Install gitleaks
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o /tmp/gitleaks.tar.gz
+          echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo mv /tmp/gitleaks /usr/local/bin/gitleaks
+
+      - name: Discover unguarded repositories
+        id: discover
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          WINDOW_MINUTES: ${{ inputs.window_minutes || '90' }}
+          ONLY_REPO: ${{ inputs.repo }}
+        run: |
+          set -euo pipefail
+          targets=()
+
+          if [ -n "$ONLY_REPO" ]; then
+            targets+=("$ONLY_REPO")
+          else
+            since=$(date -u -d "-${WINDOW_MINUTES} minutes" +%Y-%m-%dT%H:%M:%SZ)
+            echo "Looking for repositories pushed since ${since}"
+
+            # Repositories the App can see, pushed within the window, non-empty, not archived.
+            # shellcheck disable=SC2016  # $since is a jq variable, not a shell one
+            mapfile -t candidates < <(
+              gh api --paginate installation/repositories \
+                | jq -r --arg since "$since" \
+                  '.repositories[]
+                   | select(.archived | not)
+                   | select(.size > 0)
+                   | select(.pushed_at >= $since)
+                   | "\(.name)\t\(.default_branch)"'
+            )
+
+            for line in "${candidates[@]}"; do
+              name=${line%%$'\t'*}
+              branch=${line#*$'\t'}
+              # "Unguarded" = the default branch has never received a merged PR,
+              # so everything on it arrived by direct push (initial push or bypass).
+              # shellcheck disable=SC2016  # GraphQL variables, not shell ones
+              merged=$(gh api graphql \
+                -f owner="$ORG" -f name="$name" -f base="$branch" \
+                -f query='query($owner:String!,$name:String!,$base:String!){
+                  repository(owner:$owner,name:$name){
+                    pullRequests(states:MERGED, baseRefName:$base, first:1){ totalCount }
+                  }
+                }' --jq .data.repository.pullRequests.totalCount)
+              if [ "$merged" = "0" ]; then
+                echo "  ${name} (${branch}): pushed recently, no merged PR -> scan"
+                targets+=("$name")
+              else
+                echo "  ${name} (${branch}): ${merged} merged PR(s) -> guarded by ruleset, skip"
+              fi
+            done
+          fi
+
+          printf '%s\n' "${targets[@]}" > /tmp/targets.txt
+          echo "count=${#targets[@]}" >> "$GITHUB_OUTPUT"
+          echo "Targets: ${targets[*]:-<none>}"
+
+      - name: Scan targets with gitleaks
+        if: steps.discover.outputs.count != '0'
+        id: scan
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/reports
+          : > /tmp/findings.tsv   # repo \t head_sha \t leak_count \t issue_url
+
+          while IFS= read -r repo; do
+            [ -z "$repo" ] && continue
+            echo "::group::${repo}"
+            work="/tmp/work/${repo}"
+            rm -rf "$work"
+            git clone --quiet "https://x-access-token:${GH_TOKEN}@github.com/${ORG}/${repo}.git" "$work"
+            head=$(git -C "$work" rev-parse HEAD)
+
+            # Full history. A .gitleaks.toml at the repository root is honoured
+            # automatically, matching the PR-time workflow.
+            report="/tmp/reports/${repo}.json"
+            set +e
+            (cd "$work" && gitleaks git . --no-banner --redact --report-format json --report-path "$report")
+            rc=$?
+            set -e
+
+            case "$rc" in
+              0) echo "clean";;
+              1)
+                count=$(jq length "$report")
+                echo "::warning::${repo}: ${count} finding(s)"
+
+                title="[gitleaks] secrets detected in unguarded push (${head:0:7})"
+                existing=$(gh issue list --repo "${ORG}/${repo}" --state open --search "\"${title}\" in:title" --json url --jq '.[0].url // empty')
+                if [ -n "$existing" ]; then
+                  echo "issue already exists: ${existing} (skip notification)"
+                  echo "$existing" > "/tmp/reports/${repo}.dup"
+                else
+                  body=$(
+                    printf '%s\n\n' "gitleaks が \`${ORG}/${repo}\` の全履歴(HEAD \`${head}\`)から ${count} 件の秘密情報らしき文字列を検出しました。"
+                    printf '%s\n' "このブランチは PR 経由の merge を一度も受けていないため、org ruleset の Gitleaks チェックを通過していません(初回 push または bypass による直接 push)。"
+                    printf '\n%s\n' "### 対応"
+                    printf '%s\n' "1. 該当の鍵・トークンを **失効・ローテーション** する(履歴から消しても失効しなければ意味がありません)"
+                    printf '%s\n' "2. 履歴から除去する(\`git filter-repo\` 等)。既に clone されている前提で 1 を必ず先に"
+                    printf '%s\n' "3. 誤検知なら repo 直下の \`.gitleaks.toml\` に allowlist を追加"
+                    printf '\n%s\n' "### 検出箇所(値は redact 済み)"
+                    printf '%s\n' '```'
+                    jq -r '.[] | "\(.RuleID)\t\(.File):\(.StartLine)\tcommit \(.Commit[0:7])"' "$report" | sort -u | head -50
+                    printf '%s\n' '```'
+                    printf '\n%s\n' "_created by rimo/.github \`gitleaks-unguarded-push.yml\` run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}_"
+                  )
+                  issue_url=$(gh issue create --repo "${ORG}/${repo}" --title "$title" --body "$body")
+                  echo "opened ${issue_url}"
+                  printf '%s\t%s\t%s\t%s\n' "$repo" "$head" "$count" "$issue_url" >> /tmp/findings.tsv
+                fi
+                ;;
+              *) echo "::error::gitleaks failed on ${repo} (exit ${rc})"; exit "$rc";;
+            esac
+            echo "::endgroup::"
+          done < /tmp/targets.txt
+
+          echo "new_findings=$(wc -l < /tmp/findings.tsv | tr -d ' ')" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Slack
+        if: steps.scan.outputs.new_findings != '0' && steps.scan.outputs.new_findings != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "::error::SLACK_WEBHOOK_URL secret is not set"
+            exit 1
+          fi
+          lines=$(awk -F'\t' '{ printf "• <%s|%s> — %s 件 (HEAD %s)\n", $4, $1, $3, substr($2,1,7) }' /tmp/findings.tsv)
+          text=$(printf '%s :rotating_light: *gitleaks: ruleset を通っていない push から秘密情報を検出しました*\n%s\n<%s/%s/actions/runs/%s|workflow run>' \
+            "$SLACK_MENTION" "$lines" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")
+          payload=$(jq -n --arg text "$text" '{text: $text}')
+          code=$(curl -sS -o /tmp/slack.out -w '%{http_code}' -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL")
+          if [ "$code" != "200" ]; then
+            echo "::error::Slack webhook returned HTTP ${code}: $(cat /tmp/slack.out)"
+            exit 1
+          fi
+          echo "Slack notification sent."
+
+      - name: Upload reports
+        if: always() && steps.discover.outputs.count != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-reports
+          path: /tmp/reports/
+          if-no-files-found: ignore
+          retention-days: 30
