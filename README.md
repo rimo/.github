@@ -27,3 +27,9 @@ ruleset は「Do not require workflows on creation」を有効にしてある(�
 (既存の org 横断 GitHub App `rimo-github-actions`。全 repo に install 済み)と、同じく org secret の
 `SLACK_BOT_TOKEN`(`chat.postMessage` で `#rimo-voice` へ投稿。追加の secret 登録は不要)。
 誤検知は対象 repo 直下の `.gitleaks.toml` で allowlist する(両 workflow 共通)。
+
+## Gitleaks(秘密情報スキャン)について
+
+org 全体の gitleaks workflow(ruleset の required workflow と、初回 push の事後検知)は
+**`rimo/rimo-develop` の `.github/workflows/` に置いてある**(`docs/gitleaks.ja.md` 参照)。
+この repo は public で org secret が使えず内容も公開されるため、2026-08 に移した。
