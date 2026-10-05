@@ -1,0 +1,51 @@
+# Organization-wide secret scan, enforced on every repository via an
+# Organization Ruleset ("Require workflows to pass before merging").
+# The ruleset references this file in rimo/.github, PINNED TO A COMMIT SHA,
+# so it runs in the context of the target repository (with that
+# repository's GITHUB_TOKEN), not this one.
+# It lives in this PUBLIC repository on purpose: GitHub runs a workflow from
+# a private repository only on private repositories, so a private source
+# would leave every public repository unscanned and unmergeable.
+# Keep it free of secrets for the same reason (it only needs GITHUB_TOKEN).
+# Merging a change here does NOT take effect until an org admin updates the
+# ruleset's pinned SHA — see rimo/rimo-develop docs/gitleaks.ja.md.
+# Scans only the commits contained in the pull request, so pre-existing
+# secrets in old history do not block unrelated PRs.
+# Per-repository false-positive exceptions: put a .gitleaks.toml at the
+# target repository's root (gitleaks picks it up automatically).
+name: Gitleaks
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    name: Secret scan (PR commits)
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        run: |
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz -o /tmp/gitleaks.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  /tmp/gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo mv /tmp/gitleaks /usr/local/bin/gitleaks
+
+      - name: Scan PR commits for secrets
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          gitleaks git . \
+            --no-banner \
+            --redact \
+            --verbose \
+            --log-opts="${BASE_SHA}..${HEAD_SHA}"
