@@ -24,7 +24,8 @@ HEREDOC_OPEN = "python3 - <<'PY'"
 
 def embedded_source():
     lines = WORKFLOW.read_text(encoding="utf-8").splitlines()
-    start = next(i for i, line in enumerate(lines) if line.strip() == HEREDOC_OPEN)
+    start = next((i for i, line in enumerate(lines) if line.strip() == HEREDOC_OPEN), None)
+    assert start is not None, "%s not found in %s" % (HEREDOC_OPEN, WORKFLOW)
     indent = len(lines[start]) - len(lines[start].lstrip())
     body = []
     for line in lines[start + 1:]:
@@ -65,8 +66,9 @@ class ScanTest(unittest.TestCase):
     def setUpClass(cls):
         cls.guard = load_guard()
 
-    def findings(self, text):
-        return [(f.path, f.line, f.rule) for f in self.guard.scan(text)]
+    def findings(self, text, files=None, warnings=None):
+        read_file = None if files is None else files.get
+        return [(f.path, f.line, f.rule) for f in self.guard.scan(text, read_file, warnings)]
 
     def test_every_env_and_secret_flag_is_reported(self):
         flags = [flag(verb, kind) for verb in ("set", "update", "remove", "clear") for kind in ("env-vars", "secrets")]
@@ -179,17 +181,112 @@ class ScanTest(unittest.TestCase):
         )
         self.assertEqual(self.findings(text), [])
 
-    def test_action_input_is_reported_only_under_dot_github(self):
-        key = "env" + "_vars"
+    def workflow_with_step(self, uses, key_line, value_line="            A=b"):
+        lines = [
+            "jobs:",
+            "  deploy:",
+            "    steps:",
+            "      - uses: actions/checkout@v4",
+            "      - name: Deploy",
+            "        uses: " + uses,
+            "        with:",
+            "          service: example",
+            "          " + key_line,
+            value_line,
+            "      - run: echo done",
+        ]
+        return "\n".join(lines) + "\n", 9
+
+    def test_env_inputs_of_the_cloud_run_deploy_action_are_reported(self):
+        path = ".github/workflows/deploy.yml"
+        for key_line in ("env" + "_vars: |", "secrets: |", "metadata: service.yaml"):
+            with self.subTest(key=key_line):
+                content, line = self.workflow_with_step("google-github-actions/deploy-cloudrun@v2", key_line)
+                text = diff(path, ["          " + key_line], start=line)
+                self.assertEqual(self.findings(text, {path: content}), [(path, line, "action-input")])
+
+    def test_same_keys_of_other_actions_are_not_reported(self):
+        path = ".github/workflows/build.yml"
+        cases = [
+            ("docker/build-push-action@v6", "secrets: |"),
+            ("google-github-actions/deploy-cloud-functions@v3", "env" + "_vars: |"),
+            ("some/other-action@v1", "metadata: x.yaml"),
+        ]
+        for uses, key_line in cases:
+            with self.subTest(uses=uses):
+                content, line = self.workflow_with_step(uses, key_line)
+                text = diff(path, ["          " + key_line], start=line)
+                self.assertEqual(self.findings(text, {path: content}), [])
+
+    def test_job_level_secrets_of_a_reusable_workflow_call_are_not_reported(self):
+        path = ".github/workflows/call.yml"
+        content = "\n".join(
+            [
+                "jobs:",
+                "  deploy:",
+                "    uses: ./.github/workflows/deploy.yml",
+                "    secrets: inherit",
+                "  other:",
+                "    uses: ./.github/workflows/deploy.yml",
+                "    secrets:",
+                "      TOKEN: x",
+            ]
+        ) + "\n"
+        text = diff(path, ["    secrets: inherit"], start=4) + "@@ -6,0 +7,1 @@\n+    secrets:\n"
+        self.assertEqual(self.findings(text, {path: content}), [])
+
+    def test_action_inputs_outside_dot_github_are_not_reported(self):
+        content, line = self.workflow_with_step("google-github-actions/deploy-cloudrun@v2", "secrets: |")
+        text = diff("config/pipeline.yml", ["          secrets: |"], start=line)
+        self.assertEqual(self.findings(text, {"config/pipeline.yml": content}), [])
+
+    def test_without_the_file_only_the_unambiguous_input_is_reported(self):
+        path = ".github/workflows/deploy.yml"
         self.assertEqual(
-            self.findings(diff(".github/workflows/deploy.yml", ["          %s: |" % key])),
-            [(".github/workflows/deploy.yml", 1, "action-input")],
+            self.findings(diff(path, ["          %s: |" % ("env" + "_vars")])), [(path, 1, "action-input")]
         )
-        self.assertEqual(
-            self.findings(diff(".github/actions/deploy/action.yaml", ["      %s_file: env.yaml" % key])),
-            [(".github/actions/deploy/action.yaml", 1, "action-input")],
-        )
-        self.assertEqual(self.findings(diff("config/app.yaml", ["%s: |" % key])), [])
+        self.assertEqual(self.findings(diff(path, ["          secrets: |"])), [])
+
+    def test_execution_exclusion_needs_a_pure_execute_command(self):
+        update = "gcloud run jobs update job %s A=b" % flag("update", "env-vars")
+        cases = {
+            "comment mentions execute": (["# see: gcloud run jobs execute \\", update], 2),
+            "chained after execute": (["gcloud run jobs execute job && " + update], 1),
+            "trailing comment": ([update + "  # like jobs execute"], 1),
+            "execute chained on the next line": ([update + " \\", "  && gcloud run jobs execute job"], 1),
+        }
+        for name, (added, line) in cases.items():
+            with self.subTest(case=name):
+                self.assertEqual(self.findings(diff("run.sh", added)), [("run.sh", line, "env-flag")])
+
+    def test_added_or_removed_content_that_looks_like_a_file_header_is_not_a_header(self):
+        text = "\n".join(
+            [
+                "diff --git a/deploy.sh b/deploy.sh",
+                "--- a/deploy.sh",
+                "+++ b/deploy.sh",
+                "@@ -1,1 +1,3 @@",
+                "--- old banner",
+                "+++ new banner",
+                "+gcloud run deploy svc %s A=b" % flag("set", "env-vars"),
+                "+echo done",
+            ]
+        ) + "\n"
+        self.assertEqual(self.findings(text), [("deploy.sh", 2, "env-flag")])
+
+    def test_quoted_path_is_reported_as_unchecked(self):
+        text = "\n".join(
+            [
+                'diff --git "a/de\\tploy.sh" "b/de\\tploy.sh"',
+                '--- "a/de\\tploy.sh"',
+                '+++ "b/de\\tploy.sh"',
+                "@@ -0,0 +1,1 @@",
+                "+gcloud run deploy svc %s A=b" % flag("set", "env-vars"),
+            ]
+        ) + "\n"
+        warnings = []
+        self.assertEqual(self.findings(text, warnings=warnings), [])
+        self.assertEqual(len(warnings), 1)
 
     def test_the_workflow_does_not_report_itself(self):
         added = WORKFLOW.read_text(encoding="utf-8").splitlines()
@@ -218,7 +315,11 @@ class DecideTest(unittest.TestCase):
 
 
 class EndToEndTest(unittest.TestCase):
-    """Runs the embedded script the way the workflow does (python3 - <<PY) in a scratch git repo."""
+    """Runs the embedded script the way the workflow does (python3 - <<PY) in a scratch git repo.
+
+    actions/checkout gives a pull request's merge commit, so the script diffs HEAD against
+    its first parent. Without a merge commit it falls back to BASE_SHA...HEAD_SHA.
+    """
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -226,7 +327,7 @@ class EndToEndTest(unittest.TestCase):
         self.git("init", "-q", "-b", "main")
         self.git("config", "user.email", "test@example.com")
         self.git("config", "user.name", "test")
-        (self.repo / "deploy.sh").write_text('gcloud run deploy svc --image "$IMAGE"\n', encoding="utf-8")
+        self.write("deploy.sh", 'gcloud run deploy svc --image "$IMAGE"\n')
         self.git("add", ".")
         self.git("commit", "-q", "-m", "base")
         self.base = self.git("rev-parse", "HEAD")
@@ -237,35 +338,95 @@ class EndToEndTest(unittest.TestCase):
     def git(self, *args):
         return subprocess.run(["git", *args], cwd=self.repo, check=True, capture_output=True, text=True).stdout.strip()
 
-    def commit(self, content):
-        (self.repo / "deploy.sh").write_text(content, encoding="utf-8")
+    def write(self, name, content):
+        (self.repo / name).write_text(content, encoding="utf-8")
+
+    def pull_request(self, name, content, merge=True):
+        """Commits a change on a branch; with merge=True leaves HEAD on the merge commit."""
+        self.git("switch", "-q", "-c", "feature")
+        self.write(name, content)
         self.git("add", ".")
         self.git("commit", "-q", "-m", "change")
-        return self.git("rev-parse", "HEAD")
+        head = self.git("rev-parse", "HEAD")
+        if merge:
+            self.git("switch", "-q", "main")
+            self.write("unrelated.txt", "base moved on\n")
+            self.git("add", ".")
+            self.git("commit", "-q", "-m", "base moved on")
+            self.git("merge", "-q", "--no-ff", "-m", "merge", "feature")
+        return head
 
-    def run_guard(self, base, head):
+    def run_guard(self, base=None, head=None):
         env = {key: value for key, value in os.environ.items() if not key.startswith("GITHUB_")}
-        env.update({"BASE_SHA": base, "HEAD_SHA": head})
-        env.pop("PR_NUMBER", None)
+        for key in ("PR_NUMBER", "BASE_SHA", "HEAD_SHA"):
+            env.pop(key, None)
+        if base:
+            env.update({"BASE_SHA": base, "HEAD_SHA": head})
         return subprocess.run(
             [sys.executable, "-"], input=embedded_source(), cwd=self.repo, env=env, capture_output=True, text=True
         )
 
     def test_clean_change_passes(self):
-        head = self.commit('gcloud run deploy svc --image "$IMAGE" --region asia-northeast1\n')
-        result = self.run_guard(self.base, head)
+        self.pull_request("deploy.sh", 'gcloud run deploy svc --image "$IMAGE" --region asia-northeast1\n')
+        result = self.run_guard()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("::error", result.stdout)
+        self.assertNotIn("::warning", result.stdout)
 
     def test_added_flag_fails_and_does_not_print_the_line(self):
         secret_looking = "TOKEN=do-not-print-me"
-        head = self.commit('gcloud run deploy svc --image "$IMAGE" %s %s\n' % (flag("set", "env-vars"), secret_looking))
-        result = self.run_guard(self.base, head)
+        self.pull_request("deploy.sh", 'gcloud run deploy svc --image "$IMAGE" %s %s\n' % (flag("set", "env-vars"), secret_looking))
+        result = self.run_guard()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("::error file=deploy.sh,line=1", result.stdout)
         self.assertNotIn("do-not-print-me", result.stdout + result.stderr)
 
+    def test_change_made_only_on_the_base_branch_is_not_reported(self):
+        self.pull_request("other.sh", "echo ok\n", merge=False)
+        self.git("switch", "-q", "main")
+        self.write("base.sh", "gcloud run deploy svc %s A=b\n" % flag("set", "env-vars"))
+        self.git("add", ".")
+        self.git("commit", "-q", "-m", "base adds a flag")
+        self.git("merge", "-q", "--no-ff", "-m", "merge", "feature")
+        result = self.run_guard()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_non_ascii_file_name_is_checked(self):
+        self.pull_request("デプロイ.sh", "gcloud run deploy svc %s A=b\n" % flag("set", "env-vars"))
+        result = self.run_guard()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+
+    def test_action_input_is_resolved_from_the_file(self):
+        workflow = "\n".join(
+            [
+                "jobs:",
+                "  deploy:",
+                "    steps:",
+                "      - uses: google-github-actions/deploy-cloudrun@v2",
+                "        with:",
+                "          service: example",
+                "          secrets: |",
+                "            KEY=name:latest",
+                "      - uses: docker/build-push-action@v6",
+                "        with:",
+                "          secrets: |",
+                "            token=abc",
+            ]
+        ) + "\n"
+        (self.repo / ".github" / "workflows").mkdir(parents=True)
+        self.pull_request(".github/workflows/deploy.yml", workflow)
+        result = self.run_guard()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("line=7", result.stdout)
+        self.assertNotIn("line=11", result.stdout)
+
+    def test_without_a_merge_commit_it_uses_the_given_revisions(self):
+        head = self.pull_request("deploy.sh", "gcloud run deploy svc %s A=b\n" % flag("set", "env-vars"), merge=False)
+        result = self.run_guard(self.base, head)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+
     def test_internal_error_does_not_block(self):
+        self.pull_request("deploy.sh", "echo ok\n", merge=False)
         result = self.run_guard("0" * 40, "1" * 40)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("::warning", result.stdout)

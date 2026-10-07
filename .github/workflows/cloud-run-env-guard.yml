@@ -11,20 +11,31 @@
 # service drifts from both definitions.
 #
 # What it checks: only the lines ADDED by the pull request (existing lines never
-# fail), outside documentation. It reports
+# fail), outside documentation (*.md / *.txt / ... and anything under docs/).
+# It reports
 #   - the gcloud flags that set / update / remove / clear env vars or secrets,
-#     and the env-vars file flag (not on a `jobs execute` command: that is a
-#     per-execution override and does not change the job),
+#     and the env-vars file flag. Not on a command that only runs
+#     `jobs execute` (a per-execution override that does not change the job);
+#     the flag has to be on the same line or on `\`-continued lines of it,
 #   - replacing a Cloud Run service or job from a YAML file,
-#   - the env inputs of a deploy action under .github/.
+#   - the env / secrets / metadata inputs of the Cloud Run deploy action in a
+#     workflow or action file under .github/.
 # The matched line is never printed (it may carry a value); only file and line.
+#
+# What it does not see: a value added inside a YAML file that an existing
+# replace command already applies, config files baked into the image, changes
+# made from a console or a local gcloud, and GKE workloads.
 #
 # Intended exceptions (e.g. a per-PR preview service that is outside iac) are
 # approved by a HUMAN adding the label `allow-cloud-run-env-write` to the pull
 # request and re-running this check. There is no allowlist in this file.
 #
 # The script fails OPEN on its own errors (a warning, exit 0): a bug here must
-# not block merges across the organization.
+# not block merges across the organization. A failure to read the labels is not
+# such an error: findings then fail as if the label were absent.
+#
+# The checkout is the pull request's merge commit, so the diff is taken against
+# its first parent (the current base) and two commits of history are enough.
 #
 # Self-contained on purpose: the ruleset runs this file in the context of the
 # target repository, so it cannot load a script from this repository. The tests
@@ -48,10 +59,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          fetch-depth: 0
+          fetch-depth: 2
 
       - name: Detect added Cloud Run env writes
         env:
+          # Used only when HEAD is not a merge commit (not expected on pull_request).
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -75,14 +87,17 @@ jobs:
           ENV_FLAG = re.compile(r"--(?:(?:set|update|remove|clear)-(?:env-vars|secrets)|env-vars-file)(?![\w-])")
           REPLACE = re.compile(r"\brun\s+(?:services|jobs)\s+replace\b")
           EXECUTE = re.compile(r"\bjobs\s+execute\b")
-          ACTION_INPUT = re.compile(r"^\s*env_vars(?:_file)?\s*:")
+          OTHER_RUN_COMMAND = re.compile(r"\brun\s+(?:deploy\b|services\s+\w+|jobs\s+(?:update|create|deploy|replace)\b)")
+          ACTION_INPUT = re.compile(r"^\s*(env_vars(?:_file)?|secrets|metadata)\s*:")
+          UNAMBIGUOUS_INPUTS = ("env_vars", "env_vars_file")
+          DEPLOY_ACTION = re.compile(r"^\s*(?:-\s+)?uses\s*:\s*\S*deploy-cloudrun\b")
           COMMENT = re.compile(r"^\s*#")
           HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 
           MESSAGES = {
               "env-flag": "gcloud run の env / secret 参照を書く引数が、この PR で追加されています。",
               "replace": "Cloud Run の service / job を YAML で置き換えるコマンドが、この PR で追加されています。",
-              "action-input": "deploy 用 action の env を書く入力が、この PR で追加されています。",
+              "action-input": "Cloud Run の deploy 用 action の env / secret 参照 / metadata の入力が、この PR で追加されています。",
           }
           GUIDE = (
               "Cloud Run の env・secret 参照は rimo/iac-google-cloud の terraform/services/<slug>/<env>/ で管理します。"
@@ -97,59 +112,109 @@ jobs:
               return path.lower().endswith(SKIPPED_SUFFIXES) or "docs" in path.split("/")[:-1]
 
 
-          def scan_command(path, command):
+          def indent_of(text):
+              return len(text) - len(text.lstrip(" "))
+
+
+          def in_deploy_action_step(lines, index):
+              """Whether line `index` (0-based) of a workflow / action file is inside a step that uses the Cloud Run deploy action."""
+              if index >= len(lines):
+                  return False
+              key_indent = indent_of(lines[index])
+              start = None
+              for i in range(index - 1, -1, -1):
+                  text = lines[i]
+                  if text.strip() and not COMMENT.match(text) and text.lstrip().startswith("- ") and indent_of(text) < key_indent:
+                      start = i
+                      break
+              if start is None:
+                  return False
+              step_indent = indent_of(lines[start])
+              for i in range(start, len(lines)):
+                  text = lines[i]
+                  if i > start and text.strip() and not COMMENT.match(text) and indent_of(text) <= step_indent:
+                      break
+                  if DEPLOY_ACTION.match(text):
+                      return True
+              return False
+
+
+          def is_action_input(path, number, text, read_file):
+              match = ACTION_INPUT.match(text)
+              if not match or not path.startswith(".github/") or not path.lower().endswith((".yml", ".yaml")):
+                  return False
+              content = read_file(path) if read_file else None
+              if content is None:
+                  return match.group(1) in UNAMBIGUOUS_INPUTS
+              return in_deploy_action_step(content.splitlines(), number - 1)
+
+
+          def scan_command(path, command, read_file):
               """command: the added lines of one logical command, as [(line number, text)]."""
               findings = []
               joined = " ".join(text.rstrip().rstrip("\\") for _, text in command)
-              is_execution = bool(EXECUTE.search(joined))
+              is_execution = bool(EXECUTE.search(joined)) and not OTHER_RUN_COMMAND.search(joined)
               replace_reported = False
               for number, text in command:
-                  if COMMENT.match(text):
-                      continue
                   if ENV_FLAG.search(text) and not is_execution:
                       findings.append(Finding(path, number, "env-flag"))
                   if REPLACE.search(text):
                       findings.append(Finding(path, number, "replace"))
                       replace_reported = True
-                  if ACTION_INPUT.match(text) and path.startswith(".github/"):
+                  if is_action_input(path, number, text, read_file):
                       findings.append(Finding(path, number, "action-input"))
-              if not replace_reported and REPLACE.search(joined) and not COMMENT.match(command[0][1]):
+              if not replace_reported and REPLACE.search(joined):
                   findings.append(Finding(path, command[0][0], "replace"))
               return findings
 
 
-          def scan(diff_text):
-              """Returns the findings in the added lines of a unified diff."""
+          def scan(diff_text, read_file=None, warnings=None):
+              """Returns the findings in the added lines of a unified diff.
+
+              read_file(path) returns the new content of a file (or None); it is used to tell
+              which action a workflow step uses. Paths that could not be parsed are appended
+              to warnings.
+              """
               findings = []
               path = None
               number = 0
+              in_header = False
               command = []
 
               def flush():
                   if command and path and not is_skipped(path):
-                      findings.extend(scan_command(path, command))
+                      findings.extend(scan_command(path, command, read_file))
                   del command[:]
 
               for line in diff_text.splitlines():
-                  if line.startswith("+++ "):
+                  if line.startswith("diff --git "):
                       flush()
-                      target = line[4:].strip()
-                      path = target[2:] if target.startswith("b/") else None
-                      continue
-                  if line.startswith("--- ") or line.startswith("diff --git "):
-                      flush()
+                      path = None
+                      in_header = True
                       continue
                   hunk = HUNK.match(line)
                   if hunk:
                       flush()
+                      in_header = False
                       number = int(hunk.group(1))
+                      continue
+                  if in_header:
+                      if line.startswith("+++ "):
+                          target = line[4:].strip()
+                          if target.startswith("b/"):
+                              path = target[2:]
+                          elif target != "/dev/null" and warnings is not None:
+                              warnings.append(target)
                       continue
                   if line.startswith("+"):
                       text = line[1:]
-                      command.append((number, text))
-                      number += 1
-                      if not text.rstrip().endswith("\\"):
+                      if COMMENT.match(text):
                           flush()
+                      else:
+                          command.append((number, text))
+                          if not text.rstrip().endswith("\\"):
+                              flush()
+                      number += 1
                       continue
                   flush()
                   if line.startswith(" "):
@@ -191,13 +256,15 @@ jobs:
               return value
 
 
-          def report(findings, labels, code):
+          def report(findings, labels, code, unparsed):
               level = "error" if code else "notice"
               for finding in findings:
                   print(
                       "::%s file=%s,line=%d,title=%s (%s)::%s%s"
                       % (level, escape_property(finding.path), finding.line, TITLE, finding.rule, MESSAGES[finding.rule], GUIDE)
                   )
+              if unparsed:
+                  print("::warning title=%s::%d changed file(s) have a name this check cannot parse and were not checked." % (TITLE, len(unparsed)))
               if not findings:
                   print("No Cloud Run env writes were added by this pull request.")
               elif code == 0:
@@ -215,16 +282,31 @@ jobs:
                       output.write("\n%s\n" % GUIDE)
 
 
-          def main():
-              revisions = os.environ["BASE_SHA"] + "..." + os.environ["HEAD_SHA"]
-              diff = subprocess.run(
-                  ["git", "diff", "--no-color", "--no-ext-diff", "--find-renames", "--unified=0", revisions],
-                  check=True, capture_output=True, text=True, errors="replace",
+          def git(*args):
+              return subprocess.run(
+                  ["git", "-c", "core.quotePath=false", *args], check=True, capture_output=True, text=True, errors="replace"
               ).stdout
-              findings = scan(diff)
+
+
+          def main():
+              # actions/checkout leaves HEAD on the pull request's merge commit: its first parent is the base.
+              if len(git("rev-list", "--parents", "-n", "1", "HEAD").split()) == 3:
+                  revisions, new = ["HEAD^1", "HEAD"], "HEAD"
+              else:
+                  revisions, new = [os.environ["BASE_SHA"] + "..." + os.environ["HEAD_SHA"]], os.environ["HEAD_SHA"]
+
+              def read_file(path):
+                  try:
+                      return git("show", "%s:%s" % (new, path))
+                  except Exception:
+                      return None
+
+              unparsed = []
+              diff = git("diff", "--no-color", "--no-ext-diff", "--find-renames", "--unified=0", *revisions)
+              findings = scan(diff, read_file, unparsed)
               labels = fetch_labels() if findings else []
               code = decide(findings, labels)
-              report(findings, labels, code)
+              report(findings, labels, code, unparsed)
               return code
 
 
