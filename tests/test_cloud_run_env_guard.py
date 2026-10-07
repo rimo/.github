@@ -235,6 +235,28 @@ class ScanTest(unittest.TestCase):
         text = diff(path, ["    secrets: inherit"], start=4) + "@@ -6,0 +7,1 @@\n+    secrets:\n"
         self.assertEqual(self.findings(text, {path: content}), [])
 
+    def test_env_input_passed_to_a_reusable_workflow_is_reported(self):
+        path = ".github/workflows/call.yml"
+        key = "env" + "_vars"
+        content = "\n".join(
+            [
+                "on:",
+                "  push:",
+                "    branches:",
+                "    - main",
+                "jobs:",
+                "  build:",
+                "    steps:",
+                "    - uses: docker/build-push-action@v6",
+                "  deploy:",
+                "    uses: ./.github/workflows/deploy.yml",
+                "    with:",
+                "      %s: A=b" % key,
+            ]
+        ) + "\n"
+        text = diff(path, ["      %s: A=b" % key], start=12)
+        self.assertEqual(self.findings(text, {path: content}), [(path, 12, "action-input")])
+
     def test_action_inputs_outside_dot_github_are_not_reported(self):
         content, line = self.workflow_with_step("google-github-actions/deploy-cloudrun@v2", "secrets: |")
         text = diff("config/pipeline.yml", ["          secrets: |"], start=line)
@@ -419,6 +441,24 @@ class EndToEndTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("line=7", result.stdout)
         self.assertNotIn("line=11", result.stdout)
+
+    def test_annotation_uses_the_line_number_of_the_pull_request_head(self):
+        body = "".join("echo step %d\n" % i for i in range(1, 11))
+        self.write("long.sh", body)
+        self.git("add", ".")
+        self.git("commit", "-q", "-m", "base file")
+        self.git("switch", "-q", "-c", "feature")
+        self.write("long.sh", body + "gcloud run deploy svc %s A=b\n" % flag("set", "env-vars"))
+        self.git("add", ".")
+        self.git("commit", "-q", "-m", "change")
+        self.git("switch", "-q", "main")
+        self.write("long.sh", "# one\n# two\n# three\n" + body)
+        self.git("add", ".")
+        self.git("commit", "-q", "-m", "base adds lines above")
+        self.git("merge", "-q", "--no-ff", "-m", "merge", "feature")
+        result = self.run_guard()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("::error file=long.sh,line=11,", result.stdout)
 
     def test_without_a_merge_commit_it_uses_the_given_revisions(self):
         head = self.pull_request("deploy.sh", "gcloud run deploy svc %s A=b\n" % flag("set", "env-vars"), merge=False)

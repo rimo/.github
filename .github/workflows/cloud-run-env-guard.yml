@@ -91,6 +91,7 @@ jobs:
           ACTION_INPUT = re.compile(r"^\s*(env_vars(?:_file)?|secrets|metadata)\s*:")
           UNAMBIGUOUS_INPUTS = ("env_vars", "env_vars_file")
           DEPLOY_ACTION = re.compile(r"^\s*(?:-\s+)?uses\s*:\s*\S*deploy-cloudrun\b")
+          STEP_USES = re.compile(r"^\s*(?:-\s+)?uses\s*:\s*\S")
           COMMENT = re.compile(r"^\s*#")
           HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 
@@ -116,10 +117,14 @@ jobs:
               return len(text) - len(text.lstrip(" "))
 
 
-          def in_deploy_action_step(lines, index):
-              """Whether line `index` (0-based) of a workflow / action file is inside a step that uses the Cloud Run deploy action."""
+          def step_action(lines, index):
+              """The action of the step that contains line `index` (0-based) of a workflow / action file.
+
+              "deploy": the Cloud Run deploy action. "other": another action. None: the line is not
+              inside a step that uses an action (e.g. the `with:` of a job that calls a reusable workflow).
+              """
               if index >= len(lines):
-                  return False
+                  return None
               key_indent = indent_of(lines[index])
               start = None
               for i in range(index - 1, -1, -1):
@@ -128,25 +133,35 @@ jobs:
                       start = i
                       break
               if start is None:
-                  return False
+                  return None
               step_indent = indent_of(lines[start])
-              for i in range(start, len(lines)):
+              end = len(lines)
+              for i in range(start + 1, len(lines)):
                   text = lines[i]
-                  if i > start and text.strip() and not COMMENT.match(text) and indent_of(text) <= step_indent:
+                  if text.strip() and not COMMENT.match(text) and indent_of(text) <= step_indent:
+                      end = i
                       break
+              if index >= end:
+                  return None
+              action = None
+              for text in lines[start:end]:
                   if DEPLOY_ACTION.match(text):
-                      return True
-              return False
+                      return "deploy"
+                  if STEP_USES.match(text):
+                      action = "other"
+              return action
 
 
           def is_action_input(path, number, text, read_file):
               match = ACTION_INPUT.match(text)
               if not match or not path.startswith(".github/") or not path.lower().endswith((".yml", ".yaml")):
                   return False
+              unambiguous = match.group(1) in UNAMBIGUOUS_INPUTS
               content = read_file(path) if read_file else None
               if content is None:
-                  return match.group(1) in UNAMBIGUOUS_INPUTS
-              return in_deploy_action_step(content.splitlines(), number - 1)
+                  return unambiguous
+              action = step_action(content.splitlines(), number - 1)
+              return action == "deploy" or (unambiguous and action is None)
 
 
           def scan_command(path, command, read_file):
@@ -288,22 +303,44 @@ jobs:
               ).stdout
 
 
+          def read_revision(revision, path):
+              try:
+                  return git("show", "%s:%s" % (revision, path))
+              except Exception:
+                  return None
+
+
+          def to_head_lines(findings, merged, head):
+              """Line numbers of the merge commit -> those of the pull request head, which is what
+              GitHub shows an annotation against. They differ when the base changed the same file.
+              A line is moved only when its text occurs exactly once in the head's file."""
+              result = []
+              for finding in findings:
+                  line = finding.line
+                  merged_text = (read_revision(merged, finding.path) or "").splitlines()
+                  head_text = (read_revision(head, finding.path) or "").splitlines()
+                  if line <= len(merged_text) and head_text.count(merged_text[line - 1]) == 1:
+                      line = head_text.index(merged_text[line - 1]) + 1
+                  result.append(finding._replace(line=line))
+              return result
+
+
           def main():
-              # actions/checkout leaves HEAD on the pull request's merge commit: its first parent is the base.
-              if len(git("rev-list", "--parents", "-n", "1", "HEAD").split()) == 3:
+              # actions/checkout leaves HEAD on the pull request's merge commit: its first parent is
+              # the base and its second parent is the pull request head.
+              is_merge = len(git("rev-list", "--parents", "-n", "1", "HEAD").split()) == 3
+              if is_merge:
                   revisions, new = ["HEAD^1", "HEAD"], "HEAD"
               else:
+                  # Not expected on pull_request. Kept for running the script by hand on a full clone;
+                  # on the workflow's shallow checkout this diff fails and the script fails open.
                   revisions, new = [os.environ["BASE_SHA"] + "..." + os.environ["HEAD_SHA"]], os.environ["HEAD_SHA"]
-
-              def read_file(path):
-                  try:
-                      return git("show", "%s:%s" % (new, path))
-                  except Exception:
-                      return None
 
               unparsed = []
               diff = git("diff", "--no-color", "--no-ext-diff", "--find-renames", "--unified=0", *revisions)
-              findings = scan(diff, read_file, unparsed)
+              findings = scan(diff, lambda path: read_revision(new, path), unparsed)
+              if is_merge:
+                  findings = to_head_lines(findings, "HEAD", "HEAD^2")
               labels = fetch_labels() if findings else []
               code = decide(findings, labels)
               report(findings, labels, code, unparsed)
