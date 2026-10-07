@@ -1,0 +1,19 @@
+# Throwaway file for rimo/.github#6 (never merged). The trigger is manual only.
+name: e2e example
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  example:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/build-push-action@v6
+        with:
+          secrets: |
+            example=not-a-cloud-run-secret
+      - uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: example
+          secrets: |
+            EXAMPLE=example-secret-name:latest
