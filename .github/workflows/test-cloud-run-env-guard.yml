@@ -1,0 +1,26 @@
+# Runs the tests of the script embedded in cloud-run-env-guard.yml. This
+# workflow is for this repository only (it is not referenced by a ruleset).
+name: Test Cloud Run env guard
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/cloud-run-env-guard.yml
+      - .github/workflows/test-cloud-run-env-guard.yml
+      - tests/**
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test Cloud Run env guard
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Run tests
+        run: python3 -m unittest discover -s tests -v
